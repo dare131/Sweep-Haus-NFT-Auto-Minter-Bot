@@ -1,0 +1,11 @@
+# Proxies — one per line
+# Supported formats:
+#   http://host:port
+#   http://user:password@host:port
+#   socks5://user:password@host:port
+# Lines starting with # are ignored
+# Leave empty or delete file to run without proxies (direct IP)
+
+http://user1:pass1@1.2.3.4:8080
+http://user2:pass2@5.6.7.8:3128
+http://9.10.11.12:1080

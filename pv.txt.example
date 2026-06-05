@@ -1,0 +1,8 @@
+# Private keys — one per line
+# Supports with or without 0x prefix
+# Lines starting with # are ignored
+# NEVER commit this file — it is in .gitignore
+
+0xabc123def456abc123def456abc123def456abc123def456abc123def456abc1
+0xdef456abc123def456abc123def456abc123def456abc123def456abc123def4
+abc123def456abc123def456abc123def456abc123def456abc123def456abc123

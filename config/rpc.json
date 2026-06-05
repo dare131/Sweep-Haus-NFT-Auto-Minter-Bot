@@ -1,0 +1,58 @@
+{
+  "_comment": "Add your chains here. 'type' must be 'mainnet' or 'testnet'. RPC list is tried in order if first fails.",
+  "chains": {
+    "x1_testnet": {
+      "chain_id": 10778,
+      "name": "X1 EcoChain Testnet",
+      "type": "testnet",
+      "rpc": [
+        "https://x1-testnet.xen.network/",
+        "https://x1testnet.xenfyi.com/"
+      ],
+      "explorer": "https://explorer.x1-testnet.xen.network",
+      "sweep_haus_chain_id": 10778,
+      "native_symbol": "X1T",
+      "native_currency_address": "0xEeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+    },
+    "base_mainnet": {
+      "chain_id": 8453,
+      "name": "Base Mainnet",
+      "type": "mainnet",
+      "rpc": [
+        "https://mainnet.base.org",
+        "https://base.llamarpc.com",
+        "https://base-rpc.publicnode.com"
+      ],
+      "explorer": "https://basescan.org",
+      "sweep_haus_chain_id": 8453,
+      "native_symbol": "ETH",
+      "native_currency_address": "0xEeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+    },
+    "optimism_mainnet": {
+      "chain_id": 10,
+      "name": "Optimism Mainnet",
+      "type": "mainnet",
+      "rpc": [
+        "https://mainnet.optimism.io",
+        "https://optimism.llamarpc.com"
+      ],
+      "explorer": "https://optimistic.etherscan.io",
+      "sweep_haus_chain_id": 10,
+      "native_symbol": "ETH",
+      "native_currency_address": "0xEeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+    },
+    "arbitrum_mainnet": {
+      "chain_id": 42161,
+      "name": "Arbitrum One",
+      "type": "mainnet",
+      "rpc": [
+        "https://arb1.arbitrum.io/rpc",
+        "https://arbitrum.llamarpc.com"
+      ],
+      "explorer": "https://arbiscan.io",
+      "sweep_haus_chain_id": 42161,
+      "native_symbol": "ETH",
+      "native_currency_address": "0xEeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+    }
+  }
+}

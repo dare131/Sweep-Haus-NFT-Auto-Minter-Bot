@@ -1,0 +1,92 @@
+{
+  "_comment": "Global settings apply to all chains. Per-chain settings override globals. Set 'null' to use dynamic values or disable a filter.",
+
+  "global": {
+    "_comment_mode": "Options: 'testnet' (only testnet chains), 'mainnet' (only mainnet chains), 'all' (everything enabled)",
+    "mode": "testnet",
+
+    "_comment_concurrency": "How many wallets run in parallel. Keep low to avoid RPC rate limits.",
+    "concurrency": 3,
+
+    "_comment_delay": "[min, max] seconds of random delay between wallets. Reduces detection and API hammering.",
+    "delay_between_wallets_sec": [5, 15],
+
+    "_comment_cooldown": "Hours between mint sessions per wallet. 24 = once per day.",
+    "cooldown_hours": 24,
+
+    "_comment_cooldown_on_fail": "If true, cooldown is set even if all mints fail. If false, cooldown only set on any success.",
+    "cooldown_on_fail": false,
+
+    "_comment_target_mints": "[min, max] random number of NFTs to mint per wallet per session.",
+    "target_mints_per_session": [1, 5],
+
+    "_comment_index_cache_hours": "How long to use the cached collection list before refreshing from API.",
+    "index_cache_hours": 6,
+
+    "_comment_max_api_pages": "Max pages to fetch from Sweep Haus API per refresh (16 items/page).",
+    "max_api_pages": 3
+  },
+
+  "chains": {
+    "x1_testnet": {
+      "_comment": "X1 EcoChain Testnet — free airdrop farming",
+      "enabled": true,
+
+      "_comment_max_price_native": "Max price per NFT in native token. 0 = free only. null = no limit.",
+      "max_price_native": 0.001,
+
+      "_comment_gas_price_gwei": "Set gas price in Gwei. null = use on-chain eth_gasPrice dynamically.",
+      "gas_price_gwei": 1,
+
+      "_comment_gas_limit": "Hard gas limit per transaction. 280000 is safe for most Sweep Haus claim().",
+      "gas_limit": 280000,
+
+      "_comment_gas_multiplier": "Multiplier on top of base gas price for maxFeePerGas.",
+      "gas_multiplier": 1.2,
+
+      "_comment_priority_multiplier": "Multiplier on top of base gas price for maxPriorityFeePerGas.",
+      "priority_multiplier": 1.1,
+
+      "_comment_gas_buffer_gwei": "Extra Gwei held in reserve for gas costs when checking balance.",
+      "gas_buffer_gwei": 350000
+    },
+
+    "base_mainnet": {
+      "_comment": "Base mainnet — disabled by default. Enable carefully, real ETH.",
+      "enabled": false,
+
+      "max_price_native": 0.00005,
+
+      "_comment_max_price_usd_equiv": "Max price in USD equivalent (estimation only, not real USDC payment). null = skip check.",
+      "max_price_usd_equiv": 0.10,
+
+      "gas_price_gwei": null,
+      "gas_limit": 300000,
+      "gas_multiplier": 1.3,
+      "priority_multiplier": 1.1,
+      "gas_buffer_gwei": 500000
+    },
+
+    "optimism_mainnet": {
+      "enabled": false,
+      "max_price_native": 0.00005,
+      "max_price_usd_equiv": 0.10,
+      "gas_price_gwei": null,
+      "gas_limit": 280000,
+      "gas_multiplier": 1.3,
+      "priority_multiplier": 1.1,
+      "gas_buffer_gwei": 400000
+    },
+
+    "arbitrum_mainnet": {
+      "enabled": false,
+      "max_price_native": 0.00005,
+      "max_price_usd_equiv": 0.10,
+      "gas_price_gwei": null,
+      "gas_limit": 280000,
+      "gas_multiplier": 1.3,
+      "priority_multiplier": 1.1,
+      "gas_buffer_gwei": 400000
+    }
+  }
+}
