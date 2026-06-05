@@ -69,7 +69,10 @@ class ChainConfig:
         self.enabled: bool = c.get("enabled", False)
         self.max_price_native: Optional[float] = _get(c, g, "max_price_native", None)
         self.max_price_usd_equiv: Optional[float] = _get(c, g, "max_price_usd_equiv", None)
-        self.gas_price_gwei: Optional[float] = _get(c, g, "gas_price_gwei", None)
+        # gas_price_gwei: None or 0 both mean "use on-chain eth_gasPrice dynamically"
+        # Beginner-friendly: setting 0 = auto, same as null
+        _gwei = _get(c, g, "gas_price_gwei", None)
+        self.gas_price_gwei: Optional[float] = None if (_gwei is None or _gwei == 0) else float(_gwei)
         self.gas_limit: int = _get(c, g, "gas_limit", 280000)
         self.gas_multiplier: float = _get(c, g, "gas_multiplier", 1.2)
         self.priority_multiplier: float = _get(c, g, "priority_multiplier", 1.1)

@@ -35,8 +35,8 @@
       "_comment_max_price_native": "Max price per NFT in native token. 0 = free only. null = no limit.",
       "max_price_native": 0.001,
 
-      "_comment_gas_price_gwei": "Set gas price in Gwei. null = use on-chain eth_gasPrice dynamically.",
-      "gas_price_gwei": 1,
+      "_comment_gas_price_gwei": "Gas price in Gwei. 0 or null = use on-chain eth_gasPrice dynamically. Set a number to fix it (e.g. 1 for X1 testnet if chain is slow to respond).",
+      "gas_price_gwei": 0,
 
       "_comment_gas_limit": "Hard gas limit per transaction. 280000 is safe for most Sweep Haus claim().",
       "gas_limit": 280000,
