@@ -76,7 +76,10 @@ class ChainConfig:
         self.gas_limit: int = _get(c, g, "gas_limit", 280000)
         self.gas_multiplier: float = _get(c, g, "gas_multiplier", 1.2)
         self.priority_multiplier: float = _get(c, g, "priority_multiplier", 1.1)
-        self.gas_buffer_gwei: int = _get(c, g, "gas_buffer_gwei", 350000)
+        # gas_buffer_units: gas unit count reserved for fee estimation in balance check.
+        # Buffer in wei = gas_buffer_units * base_gas_price (computed in minter.py)
+        # Named "units" not "gwei" — it is multiplied BY gas price, it is not itself a price.
+        self.gas_buffer_units: int = _get(c, g, "gas_buffer_units", 350000)
 
         self._w3: Optional[Web3] = None
 

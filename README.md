@@ -26,8 +26,38 @@ cp config/config.json.example config/config.json
 cp pv.txt.example pv.txt
 cp proxy.txt.example proxy.txt
 
-# 3. Run
+# 3. Test your setup first (no transactions sent)
+python main.py --dry-run
+
+# 4. Run live
 python main.py
+```
+
+---
+
+## Usage
+
+```bash
+# Single run — live transactions
+python main.py
+
+# Dry run — full pipeline, no transactions sent (safe for config testing)
+python main.py --dry-run
+
+# Loop every 24h (reads cooldown_hours from config)
+python main.py --loop
+
+# Loop every 12h
+python main.py --loop --interval 12
+
+# Dry-run loop — test config changes safely
+python main.py --dry-run --loop --interval 1
+```
+
+**Environment variables (alternative to CLI flags):**
+```env
+LOOP=true
+LOOP_INTERVAL_HOURS=24
 ```
 
 ---
@@ -36,28 +66,29 @@ python main.py
 
 ```
 Sweep-Haus-NFT-Auto-Minter-Bot/
-├── main.py                  # Entry point — runs all wallets across all chains
-├── minter.py                # Core minting engine (per-wallet logic)
-├── sweep_api.py             # Sweep Haus API client + index caching
+├── main.py                  # Entry point — CLI args, wallet loader, thread pool, loop
+├── minter.py                # Core minting engine (per-wallet, per-chain logic)
+├── sweep_api.py             # Sweep Haus API client + per-chain index caching
 ├── calldata.py              # ABI encoding / calldata builders
 ├── chain_config.py          # Chain loader from rpc.json + config.json
 ├── proxy.py                 # Proxy loader and rotation
 ├── config/
-│   ├── rpc.json             # RPC endpoints per chain (mainnet + testnet)
-│   ├── rpc.json.example     # Template — copy this to rpc.json
-│   ├── config.json          # Per-chain mint settings
-│   └── config.json.example  # Template — copy this to config.json
-├── data/                    # Auto-created: per-chain index files + mint state
-│   ├── sweep_index_x1_testnet.json   # One index file per chain
+│   ├── rpc.json             # RPC endpoints per chain (edit this)
+│   ├── rpc.json.example     # Template — copy to rpc.json
+│   ├── config.json          # Per-chain mint settings (edit this)
+│   └── config.json.example  # Template — copy to config.json
+├── data/                    # Auto-created on first run
+│   ├── sweep_index_x1_testnet.json    # Collection index per chain
 │   ├── sweep_index_base_mainnet.json
-│   └── sweep_minted.json             # Per-wallet mint history
-├── logs/                    # Auto-created: rotating log files (10MB × 5)
-├── .env                     # Secrets: bearer tokens (never commit)
-├── .env.example             # Template
-├── pv.txt                   # Private keys, one per line (never commit)
-├── pv.txt.example           # Template
-├── proxy.txt                # Proxies, one per line (optional)
-└── proxy.txt.example        # Template
+│   └── minted_0xabcd1234.json         # Mint history per wallet
+├── logs/                    # Auto-created: rotating logs (10MB × 5 files)
+│   └── sweep_bot.log
+├── .env                     # Bearer tokens — never commit
+├── .env.example
+├── pv.txt                   # Private keys — never commit
+├── pv.txt.example
+├── proxy.txt                # Proxies (optional)
+└── proxy.txt.example
 ```
 
 ---
@@ -66,7 +97,7 @@ Sweep-Haus-NFT-Auto-Minter-Bot/
 
 ### `.env` — Bearer Tokens
 
-Get your Sweep Haus bearer token from your browser's network tab while browsing sweep.haus.
+Get your Sweep Haus bearer token from your browser's DevTools → Network tab while browsing sweep.haus (look for requests to `api.sweep.haus`).
 
 ```env
 # Single token
@@ -78,6 +109,10 @@ BEARER_2=token_two
 BEARER_3=token_three
 ```
 
+If a token expires mid-run, the bot logs a clear 401 error and skips that chain instead of silently using stale data.
+
+---
+
 ### `pv.txt` — Private Keys
 
 One private key per line. With or without `0x` prefix. Lines starting with `#` are ignored.
@@ -87,11 +122,13 @@ One private key per line. With or without `0x` prefix. Lines starting with `#` a
 0xdef456...
 ```
 
-> **Never commit this file.** It is in `.gitignore` and must stay that way.
+> **Never commit this file.** It is in `.gitignore`. Do not run on shared or untrusted hosts.
+
+---
 
 ### `proxy.txt` — Proxies (Optional)
 
-One proxy per line. Leave file empty or delete it to run without proxies (direct IP).
+One proxy per line. Leave file empty or delete it to run without proxies.
 
 ```
 http://user:pass@1.2.3.4:8080
@@ -99,13 +136,11 @@ http://5.6.7.8:3128
 socks5://user:pass@9.10.11.12:1080
 ```
 
-Proxies are assigned per-wallet by index (wallet 0 → proxy 0, wallet 1 → proxy 1, wrapping around).
+Proxies are assigned per-wallet by index — wallet 0 → proxy 0, wallet 1 → proxy 1, wrapping around. Same wallet always uses the same proxy across runs.
 
 ---
 
 ### `config/rpc.json` — Chain RPC Endpoints
-
-Add any EVM chain Sweep Haus supports. The bot tries RPCs in the listed order and falls back automatically.
 
 ```json
 {
@@ -140,16 +175,14 @@ Add any EVM chain Sweep Haus supports. The bot tries RPCs in the listed order an
 }
 ```
 
-**Fields:**
-
 | Field | Required | Description |
-|-------|----------|-------------|
-| `chain_id` | ✅ | EVM chain ID |
-| `type` | ✅ | `"testnet"` or `"mainnet"` — used by mode filter |
+|---|---|---|
+| `chain_id` | ✅ | EVM chain ID — bot validates this against the RPC response |
+| `type` | ✅ | `"testnet"` or `"mainnet"` — used by the `mode` filter |
 | `rpc` | ✅ | List of RPC URLs, tried in order on failure |
-| `sweep_haus_chain_id` | ✅ | Sweep Haus internal chain filter ID (usually same as chain_id) |
-| `native_symbol` | ✅ | Display label for logs (e.g. `"ETH"`, `"X1T"`) |
-| `native_currency_address` | ✅ | Native token sentinel address (standard: `0xEeee...EE`) |
+| `sweep_haus_chain_id` | ✅ | Chain ID used in the Sweep Haus API filter (usually same as chain_id) |
+| `native_symbol` | ✅ | Display label in logs (e.g. `"ETH"`, `"X1T"`) |
+| `native_currency_address` | ✅ | Native token sentinel (`0xEeee...EE` standard) |
 
 ---
 
@@ -175,7 +208,7 @@ Add any EVM chain Sweep Haus supports. The bot tries RPCs in the listed order an
       "gas_limit": 280000,
       "gas_multiplier": 1.2,
       "priority_multiplier": 1.1,
-      "gas_buffer_gwei": 350000
+      "gas_buffer_units": 350000
     },
     "base_mainnet": {
       "enabled": false,
@@ -184,7 +217,7 @@ Add any EVM chain Sweep Haus supports. The bot tries RPCs in the listed order an
       "gas_limit": 300000,
       "gas_multiplier": 1.3,
       "priority_multiplier": 1.1,
-      "gas_buffer_gwei": 500000
+      "gas_buffer_units": 500000
     }
   }
 }
@@ -193,61 +226,72 @@ Add any EVM chain Sweep Haus supports. The bot tries RPCs in the listed order an
 **Global settings:**
 
 | Key | Description |
-|-----|-------------|
-| `mode` | `"testnet"` = only testnet chains, `"mainnet"` = only mainnet chains, `"all"` = everything enabled |
-| `concurrency` | Wallets running in parallel per chain. Keep ≤5 to avoid RPC rate limits |
-| `delay_between_wallets_sec` | `[min, max]` random delay (seconds) between wallet completions |
-| `cooldown_hours` | Hours between sessions per wallet. Default 24 = once per day |
-| `cooldown_on_fail` | `false` = cooldown only set on at least 1 success. `true` = always set cooldown |
-| `target_mints_per_session` | `[min, max]` random number of NFTs to mint per wallet per session |
+|---|---|
+| `mode` | `"testnet"` = only testnet chains, `"mainnet"` = only mainnet, `"all"` = everything enabled |
+| `concurrency` | Wallets running in parallel per chain. Keep ≤ 5 to avoid RPC rate limits |
+| `delay_between_wallets_sec` | `[min, max]` random delay in seconds between wallet completions |
+| `cooldown_hours` | Hours between sessions per wallet. Default `24` = once per day |
+| `cooldown_on_fail` | `false` = cooldown only set if ≥1 mint succeeded. `true` = always set cooldown |
+| `target_mints_per_session` | `[min, max]` random NFT count per wallet per session |
 | `index_cache_hours` | How long to use cached collection list before re-fetching from API |
-| `max_api_pages` | Max pages fetched from Sweep Haus API per refresh (16 items/page) |
+| `max_api_pages` | Max pages fetched from Sweep Haus API per refresh (16 collections/page) |
 
 **Per-chain settings:**
 
 | Key | Description |
-|-----|-------------|
+|---|---|
 | `enabled` | `true` to include this chain. Must also match `mode` filter |
-| `max_price_native` | Max NFT price in native token. `null` = no price limit |
-| `gas_price_gwei` | **`0` or `null` = use live on-chain gas price (recommended)**. Set a fixed number (e.g. `1`) only if you want to override |
-| `gas_limit` | Max gas units per transaction. `280000` is safe for most Sweep Haus mints |
-| `gas_multiplier` | `maxFeePerGas = base_gas × gas_multiplier`. Increase if txs underprice |
+| `max_price_native` | Max NFT price in native token. `null` = no limit |
+| `gas_price_gwei` | **`0` or `null` = use live on-chain gas price (recommended)**. Set a number to fix it |
+| `gas_limit` | Max gas units per transaction. `280000` safe for most Sweep Haus mints |
+| `gas_multiplier` | `maxFeePerGas = base_gas × gas_multiplier` |
 | `priority_multiplier` | `maxPriorityFeePerGas = base_gas × priority_multiplier` |
-| `gas_buffer_gwei` | Gas units reserved in balance check (prevents minting when too low on gas funds) |
+| `gas_buffer_units` | Gas units reserved for balance check buffer. `buffer_wei = gas_buffer_units × base_gas_price` |
 
-> **Gas tip:** Always leave `gas_price_gwei` at `0` unless you have a specific reason to fix it. The bot uses `eth_gasPrice` from the RPC, so it automatically adapts to network conditions.
+> **Gas tip:** Always leave `gas_price_gwei` at `0`. The bot fetches live gas from the RPC, adapting automatically. Only override if you have a specific reason.
 
 ---
 
 ## How It Works
 
-1. Bot loads all wallets from `pv.txt` and all active chains from `config/rpc.json` filtered by `mode`
-2. For each chain, active Sweep Haus collections are fetched from the API and cached locally to `data/sweep_index_{chain_key}.json` (refreshed every 6h by default)
-3. Each wallet checks its 24h cooldown, then picks 1–5 random NFTs it hasn't minted before on that chain
-4. Mint state persists to `data/sweep_minted.json` — wallets never double-mint the same contract
-5. Proxies rotate per-wallet. Bearer tokens rotate round-robin per API call
-6. All activity logged to `logs/sweep_bot.log` with rotation (10MB × 5 files)
+1. Bot loads wallets from `pv.txt` and active chains from `config/rpc.json` (filtered by `mode`)
+2. For each chain, active Sweep Haus collections are fetched from the API and cached to `data/sweep_index_{chain_key}.json` — one file per chain, refreshed every 6h
+3. Each wallet checks its 24h cooldown, then picks 1–5 random collections it hasn't minted on that chain
+4. Per-wallet mint state is stored in `data/minted_{address}.json` — wallets never double-mint the same contract
+5. On each successful mint, the ERC-721 Transfer event in the receipt is verified to confirm the NFT landed in the correct wallet
+6. Proxies rotate per-wallet. Bearer tokens rotate round-robin per API call
+7. All activity is logged to `logs/sweep_bot.log` with rotation
 
 ---
 
-## Data Files (auto-created)
+## Data Files
 
 | File | Description |
-|------|-------------|
-| `data/sweep_index_x1_testnet.json` | Collection index for X1 testnet (one file per chain) |
-| `data/sweep_minted.json` | Per-wallet mint history, keyed by address + chain |
-
-You can safely delete index files to force a fresh API fetch on next run. Do not delete `sweep_minted.json` unless you want wallets to re-mint already-minted collections.
+|---|---|
+| `data/sweep_index_{chain_key}.json` | Collection index per chain. Delete to force fresh API fetch |
+| `data/minted_{address[:10]}.json` | Per-wallet mint history. Delete only if you want wallets to re-mint |
 
 ---
 
 ## Risks & Limitations
 
-- **Testnet only by default.** Set `"mode": "mainnet"` and `"enabled": true` on mainnet chains explicitly — mainnet minting costs real gas.
+- **Testnet default.** Enable mainnet chains explicitly — real gas is at stake.
 - **Sweep Haus API is undocumented.** If they change endpoints or auth, update `sweep_api.py`.
-- **Private keys in plaintext.** `pv.txt` is gitignored but still sensitive. Do not run on shared/untrusted hosts.
-- **Gas estimation fallback.** If `estimate_gas()` fails (e.g. contract would revert), bot falls back to config `gas_limit`. A tx can still be submitted and revert on-chain.
-- **No USDC payment support.** Collections requiring ERC-20 payment are not handled. Native-token-only mints work.
+- **Private keys in plaintext.** `pv.txt` is gitignored. Do not run on shared/untrusted hosts.
+- **Gas estimation fallback.** If `estimate_gas()` fails, the bot falls back to config `gas_limit`. A tx may still be submitted and revert.
+- **No ERC-20 payment support.** Collections requiring USDC/ERC-20 payment are not handled. Native-token-only mints only.
+
+---
+
+## Support the Project
+
+If this bot saves you time, tips are appreciated — any EVM network:
+
+```
+0x4f6Fb0A6c8A4C667bdF73C0257BE162B144c1624
+```
+
+ETH / Base / Arbitrum / Optimism / Polygon or any EVM chain.
 
 ---
 

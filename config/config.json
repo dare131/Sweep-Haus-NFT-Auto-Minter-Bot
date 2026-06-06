@@ -47,8 +47,8 @@
       "_comment_priority_multiplier": "Multiplier on top of base gas price for maxPriorityFeePerGas.",
       "priority_multiplier": 1.1,
 
-      "_comment_gas_buffer_gwei": "Extra Gwei held in reserve for gas costs when checking balance.",
-      "gas_buffer_gwei": 350000
+      "_comment_gas_buffer_units": "Gas units reserved for balance check buffer. Buffer (wei) = gas_buffer_units × base_gas_price. Default 350000 is safe for most EVM chains.",
+      "gas_buffer_units": 350000
     },
 
     "base_mainnet": {
@@ -64,7 +64,7 @@
       "gas_limit": 300000,
       "gas_multiplier": 1.3,
       "priority_multiplier": 1.1,
-      "gas_buffer_gwei": 500000
+      "gas_buffer_units": 500000
     },
 
     "optimism_mainnet": {
@@ -75,7 +75,7 @@
       "gas_limit": 280000,
       "gas_multiplier": 1.3,
       "priority_multiplier": 1.1,
-      "gas_buffer_gwei": 400000
+      "gas_buffer_units": 400000
     },
 
     "arbitrum_mainnet": {
@@ -86,7 +86,7 @@
       "gas_limit": 280000,
       "gas_multiplier": 1.3,
       "priority_multiplier": 1.1,
-      "gas_buffer_gwei": 400000
+      "gas_buffer_units": 400000
     }
   }
 }

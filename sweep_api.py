@@ -1,27 +1,22 @@
 """
 sweep_api.py — Sweep Haus API client, per-chain index caching, and collection refresh.
 
-Index files are keyed by chain_key (human-readable string from rpc.json), not by
-numeric chain ID. This means:
+Index files are keyed by chain_key (human-readable string from rpc.json):
   data/sweep_index_x1_testnet.json
   data/sweep_index_base_mainnet.json
-  ...instead of sweep_index_10778.json
 
-This makes manual inspection and debugging straightforward — you can open the file
-for a specific chain without cross-referencing chain IDs.
+Mint history is stored per-wallet:
+  data/minted_0xabcd1234.json   (one file per wallet, keyed by address[:10])
 
-The sweep_haus_chain_id (int) is still passed to the API query params — it's the
-filter value Sweep Haus uses internally. It is NOT used as a file/lock key.
+This eliminates the global minted-state lock bottleneck: each wallet file has its own
+lock, so 50 concurrent wallets don't serialize on a single file write.
 
-Bearer token rotation: tokens are loaded from env and cycled round-robin per API call.
-Index cache: per-chain JSON files in data/ directory, refreshed every N hours (configurable).
+Bearer token rotation: round-robin per API call.
+401 handling: immediately raises BearerTokenError — caller skips the chain, no stale data.
 
-[RISK] The Sweep Haus API is undocumented/private. The Bearer token is required for
-authenticated requests. If the auth scheme changes, this module breaks silently unless
-status codes are checked — which they are here.
-
-[RISK] Concurrent refreshes across chains are independent (one lock per chain_key).
-Multiple wallets on the same chain share one refresh cycle via the cache TTL check.
+[RISK] The Sweep Haus API is undocumented/private. Auth scheme changes will break this.
+[RISK] Per-wallet files still need in-process locking — locks dict is created on demand.
+       Do not run two bot instances against the same data/ directory simultaneously.
 """
 
 import json
@@ -37,16 +32,24 @@ import requests
 logger = logging.getLogger("sweep_api")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-
 SWEEP_API_URL = "https://api.sweep.haus/api/nft-collections"
 
 _BEARER_TOKENS: list[str] = []
 _bearer_index = 0
 _bearer_lock = threading.Lock()
 
-# Per-chain index locks (created on demand)
+# Per-chain index locks (created on demand, keyed by chain_key)
 _index_locks: dict[str, threading.Lock] = {}
 _index_locks_meta = threading.Lock()
+
+# Per-wallet minted-state locks (created on demand, keyed by address.lower())
+_wallet_locks: dict[str, threading.Lock] = {}
+_wallet_locks_meta = threading.Lock()
+
+
+class BearerTokenError(Exception):
+    """Raised when the API returns 401 — token expired or invalid."""
+    pass
 
 
 # =====================================================================
@@ -61,7 +64,6 @@ def load_bearer_tokens() -> None:
     global _BEARER_TOKENS
     tokens = []
 
-    # Check BEARER_1, BEARER_2, ... first
     i = 1
     while True:
         val = os.environ.get(f"BEARER_{i}", "").strip()
@@ -70,7 +72,6 @@ def load_bearer_tokens() -> None:
         tokens.append(val)
         i += 1
 
-    # Fall back to single BEARER
     if not tokens:
         single = os.environ.get("BEARER", "").strip()
         if single:
@@ -87,7 +88,6 @@ def load_bearer_tokens() -> None:
 
 
 def _next_bearer() -> str:
-    """Return the next bearer token in round-robin rotation."""
     global _bearer_index
     with _bearer_lock:
         token = _BEARER_TOKENS[_bearer_index % len(_BEARER_TOKENS)]
@@ -110,19 +110,11 @@ def _make_headers() -> dict:
 
 
 # =====================================================================
-# INDEX FILE HELPERS
+# INDEX FILE HELPERS (per-chain)
 # =====================================================================
 
 def _index_path(chain_key: str) -> str:
-    """
-    Returns path like: data/sweep_index_x1_testnet.json
-    chain_key comes from rpc.json top-level key (e.g. 'x1_testnet', 'base_mainnet').
-    """
     return os.path.join(DATA_DIR, f"sweep_index_{chain_key}.json")
-
-
-def _minted_path() -> str:
-    return os.path.join(DATA_DIR, "sweep_minted.json")
 
 
 def _get_index_lock(chain_key: str) -> threading.Lock:
@@ -139,18 +131,18 @@ def load_index(chain_key: str) -> dict:
             with open(path, "r") as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"[sweep_api] Corrupt index file '{path}': {e}. Resetting.")
+            logger.warning(f"[sweep_api] Corrupt index '{path}': {e}. Resetting.")
     return {"updated_at": None, "collections": {}}
 
 
 def save_index(chain_key: str, idx: dict) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     path = _index_path(chain_key)
-    tmp_path = path + ".tmp"
+    tmp = path + ".tmp"
     try:
-        with open(tmp_path, "w") as f:
+        with open(tmp, "w") as f:
             json.dump(idx, f, indent=2)
-        os.replace(tmp_path, path)  # Atomic write
+        os.replace(tmp, path)
     except Exception as e:
         logger.error(f"[sweep_api] Failed to save index '{path}': {e}")
 
@@ -169,16 +161,8 @@ def refresh_index(
     """
     Fetch active collections from Sweep Haus API and update local index.
 
-    Args:
-        chain_key:           Human-readable key from rpc.json (e.g. 'x1_testnet').
-                             Used as the index file name and lock key.
-        sweep_haus_chain_id: Numeric chain ID sent to the Sweep Haus API as a filter.
-        max_price_native:    Max price filter (native token). None = include all.
-        max_api_pages:       Max pages to fetch (16 items/page).
-        proxy_dict:          Optional proxy dict for requests.
-
-    Returns:
-        Number of newly added collections.
+    Raises:
+        BearerTokenError: on HTTP 401 — propagates up so caller skips chain cleanly.
     """
     lock = _get_index_lock(chain_key)
     with lock:
@@ -210,11 +194,18 @@ def refresh_index(
                     proxies=proxy_dict,
                     timeout=15,
                 )
+
                 if resp.status_code == 401:
-                    logger.error("[sweep_api] Bearer token rejected (401). Check your .env tokens.")
-                    break
+                    # Hard stop — stale index is worse than no index
+                    raise BearerTokenError(
+                        f"[sweep_api] Bearer token rejected (401) for chain '{chain_key}'. "
+                        "Update BEARER in .env — token may have expired."
+                    )
+
                 if resp.status_code != 200:
-                    logger.warning(f"[sweep_api] API returned {resp.status_code} on page {page}.")
+                    logger.warning(
+                        f"[sweep_api] [{chain_key}] API returned {resp.status_code} on page {page}. Stopping."
+                    )
                     break
 
                 data = resp.json()
@@ -235,7 +226,6 @@ def refresh_index(
                     except (ValueError, TypeError):
                         price = 0.0
 
-                    # Price filter
                     if max_price_native is not None and price > max_price_native:
                         continue
 
@@ -263,11 +253,12 @@ def refresh_index(
                 page += 1
                 time.sleep(0.5)
 
+            except BearerTokenError:
+                raise  # propagate — do not swallow
             except requests.RequestException as e:
-                logger.warning(f"[sweep_api] Request error on page {page}: {e}")
+                logger.warning(f"[sweep_api] [{chain_key}] Request error on page {page}: {e}")
                 break
 
-        # Mark collections that disappeared from API as removed
         for key, entry in idx["collections"].items():
             if entry.get("status") == "active" and key not in api_contracts:
                 entry["status"] = "removed"
@@ -275,9 +266,8 @@ def refresh_index(
         idx["updated_at"] = datetime.now(timezone.utc).isoformat()
         save_index(chain_key, idx)
         logger.info(
-            f"[sweep_api] [{chain_key}] Index refreshed: "
-            f"{added} new, {len(idx['collections'])} total. "
-            f"File: sweep_index_{chain_key}.json"
+            f"[sweep_api] [{chain_key}] Refreshed: {added} new, "
+            f"{len(idx['collections'])} total → sweep_index_{chain_key}.json"
         )
         return added
 
@@ -291,13 +281,13 @@ def get_active_collections(
     proxy_dict: Optional[dict] = None,
 ) -> list[dict]:
     """
-    Return active collection list for a chain.
-    Refreshes index file (sweep_index_{chain_key}.json) if cache is stale or missing.
+    Return active collection list. Refreshes if stale.
+    Raises BearerTokenError if token is invalid during refresh.
     """
     idx = load_index(chain_key)
-    updated_at_str = idx.get("updated_at")
     needs_refresh = True
 
+    updated_at_str = idx.get("updated_at")
     if updated_at_str:
         try:
             updated_at = datetime.fromisoformat(updated_at_str)
@@ -317,10 +307,7 @@ def get_active_collections(
 
 
 def mark_collection_status(chain_key: str, contract_address: str, status: str) -> None:
-    """
-    Update a single collection's status in its chain index file.
-    Status options: 'active', 'sold_out', 'removed'
-    """
+    """Update a collection's status: 'active' | 'sold_out' | 'removed'"""
     lock = _get_index_lock(chain_key)
     with lock:
         idx = load_index(chain_key)
@@ -331,66 +318,75 @@ def mark_collection_status(chain_key: str, contract_address: str, status: str) -
 
 
 # =====================================================================
-# MINT STATE TRACKER
+# MINT STATE TRACKER — one file per wallet
 # =====================================================================
 
-_minted_lock = threading.Lock()
+def _wallet_minted_path(address: str) -> str:
+    """
+    Per-wallet mint history file.
+    Uses address[:10] (0x + 8 chars) as the filename — unambiguous, filesystem-safe.
+    Example: data/minted_0xabcd1234.json
+    """
+    return os.path.join(DATA_DIR, f"minted_{address.lower()[:10]}.json")
 
 
-def load_minted() -> dict:
-    path = _minted_path()
+def _get_wallet_lock(address: str) -> threading.Lock:
+    key = address.lower()
+    with _wallet_locks_meta:
+        if key not in _wallet_locks:
+            _wallet_locks[key] = threading.Lock()
+        return _wallet_locks[key]
+
+
+def _load_wallet_minted(address: str) -> dict:
+    path = _wallet_minted_path(address)
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"[sweep_api] Corrupt minted file: {e}. Resetting.")
-    return {}
+            logger.warning(f"[sweep_api] Corrupt wallet minted file '{path}': {e}. Resetting.")
+    return {"address": address.lower(), "minted_contracts": {}, "last_run": None}
 
 
-def save_minted(data: dict) -> None:
+def _save_wallet_minted(address: str, data: dict) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
-    path = _minted_path()
-    tmp_path = path + ".tmp"
+    path = _wallet_minted_path(address)
+    tmp = path + ".tmp"
     try:
-        with open(tmp_path, "w") as f:
+        with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
-        os.replace(tmp_path, path)
+        os.replace(tmp, path)
     except Exception as e:
-        logger.error(f"[sweep_api] Failed to save minted state: {e}")
+        logger.error(f"[sweep_api] Failed to save wallet minted '{path}': {e}")
 
 
 def get_wallet_record(address: str) -> dict:
-    with _minted_lock:
-        data = load_minted()
-        return data.get(address.lower(), {"minted_contracts": {}, "last_run": None})
+    lock = _get_wallet_lock(address)
+    with lock:
+        return _load_wallet_minted(address)
 
 
 def record_mint(address: str, chain_key: str, contract_address: str) -> None:
-    """
-    Record a successful mint for address + chain + contract.
-    Keyed by chain_key to allow same contract on different chains.
-    """
-    with _minted_lock:
-        data = load_minted()
-        wallet = data.setdefault(address.lower(), {"minted_contracts": {}, "last_run": None})
-        chain_minted = wallet["minted_contracts"].setdefault(chain_key, [])
+    """Record a successful mint. Keyed by chain_key to allow same contract on different chains."""
+    lock = _get_wallet_lock(address)
+    with lock:
+        data = _load_wallet_minted(address)
+        chain_minted = data["minted_contracts"].setdefault(chain_key, [])
         if contract_address.lower() not in chain_minted:
             chain_minted.append(contract_address.lower())
-        save_minted(data)
+        _save_wallet_minted(address, data)
 
 
 def set_last_run(address: str) -> None:
-    """Set the last run timestamp for a wallet."""
-    with _minted_lock:
-        data = load_minted()
-        wallet = data.setdefault(address.lower(), {"minted_contracts": {}, "last_run": None})
-        wallet["last_run"] = datetime.now(timezone.utc).isoformat()
-        save_minted(data)
+    lock = _get_wallet_lock(address)
+    with lock:
+        data = _load_wallet_minted(address)
+        data["last_run"] = datetime.now(timezone.utc).isoformat()
+        _save_wallet_minted(address, data)
 
 
 def is_on_cooldown(address: str, cooldown_hours: float) -> bool:
-    """Check if wallet is within its cooldown window."""
     record = get_wallet_record(address)
     last_run_str = record.get("last_run")
     if not last_run_str:
@@ -402,7 +398,7 @@ def is_on_cooldown(address: str, cooldown_hours: float) -> bool:
         hours_since = (datetime.now(timezone.utc) - last_run).total_seconds() / 3600.0
         if hours_since < cooldown_hours:
             logger.info(
-                f"[{address[:8]}] Cooldown: {hours_since:.1f}h since last run "
+                f"[{address[:8]}] Cooldown: {hours_since:.1f}h elapsed "
                 f"(cooldown={cooldown_hours}h). Skipping."
             )
             return True
