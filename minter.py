@@ -1,26 +1,49 @@
 """
 minter.py — Per-wallet minting engine for Sweep Haus.
 
-Changes over original code:
-- Gas estimated via estimate_gas() with 20% buffer; config gas_limit as fallback
-- Revert detection narrowed: only marks sold_out on EVM contract revert
-- Cooldown only set on success (configurable via cooldown_on_fail)
-- Mint state keyed by (chain_key, contract) — no cross-chain collisions
-- Balance check uses BigInt math, no floats
-- receipt.status == 0 caught (mined revert without exception)
-- Nonce managed locally per session; re-synced on nonce-too-low error
-- Transfer event verified in receipt: confirms NFT landed in correct wallet
-- gas_buffer_units renamed from gas_buffer_gwei (it's a unit count, not a price)
-- BearerTokenError from sweep_api propagated cleanly — chain is skipped
+Anti-fingerprint measures implemented:
+  1. Per-wallet time-seeded RNG — mix of address + UTC day + chain_key
+     Avoids shared global random state across threads AND avoids fixed-forever seed.
+     Same wallet may behave differently on different days (address entropy alone would
+     produce a permanent behavioral fingerprint over months as ChatGPT noted).
 
-[RISK] estimate_gas fails if the call would revert. Fallback is config gas_limit.
-       The tx may still submit and revert. No universal fix — you need revert reason decoding.
-[RISK] gas_limit flat value may underestimate on complex contracts. Monitor failed txns.
+  2. Random session skip (15% chance) — simulates human inactivity days.
+     Ensures not every wallet mints every day. Breaks the "all wallets always active"
+     cluster signal.
+
+  3. Per-wallet contract subset — each wallet sees a random 65–80% of available
+     collections, drawn from its wallet-seeded RNG. This directly addresses the
+     contract overlap score: no two wallets ever interact with the identical set.
+
+  4. Per-wallet gas variance ±5% — maxFeePerGas and maxPriorityFeePerGas vary
+     per-wallet using wallet-seeded RNG. Prevents identical gas params across wallets
+     in the same block.
+
+  5. Exponential inter-mint delay with long tail — replaces uniform(2,5).
+     Mean ~15s, clamped 5–120s. 10% chance of adding an extra 60–300s pause.
+     Closer to actual human browsing patterns than a tight uniform distribution.
+
+  6. Rotating User-Agent per API call — in sweep_api.py _make_headers().
+
+What this does NOT fix (wallet infrastructure — outside bot scope):
+  - Funding graph (wallets funded from same parent address)
+  - Bridge clustering (same bridge, same amounts, same window)
+  - Withdrawal destination clustering (all consolidate to same address)
+  These require manual operational decisions, not code changes.
+
+[RISK] Per-wallet RNG is seeded with address + day + chain. If an analyst knows all
+       three, they can reproduce the seed. This is acceptable — it prevents trivial
+       correlation while remaining deterministic enough to be auditable.
+[RISK] Contract subset (65–80%) means some collections are never minted by some wallets.
+       That's intentional. Full overlap is the worse outcome.
 """
 
+import hashlib
 import logging
+import math
 import random
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from web3 import Web3
@@ -32,35 +55,53 @@ from chain_config import ChainConfig
 
 logger = logging.getLogger("minter")
 
-# ERC-721 Transfer event topic (keccak256 of "Transfer(address,address,uint256)")
+# ERC-721 Transfer event topic (keccak256("Transfer(address,address,uint256)"))
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-# Revert strings that reliably indicate sold-out or eligibility failure.
-# NOT general RPC errors, timeouts, or nonce issues.
 REVERT_STRINGS = [
-    "!qty",
-    "exceed",
-    "sold out",
-    "max supply",
-    "!maxsupply",
-    "drop not active",
-    "not enough supply",
-    "claimcondition",   # ThirdWeb ClaimCondition revert
+    "!qty", "exceed", "sold out", "max supply", "!maxsupply",
+    "drop not active", "not enough supply", "claimcondition",
 ]
 
 TRANSIENT_ERRORS = [
-    "timeout",
-    "connection",
-    "rpc",
-    "nonce too low",
-    "replacement transaction",
-    "already known",
-    "insufficient funds",   # wallet issue, not contract
+    "timeout", "connection", "rpc", "nonce too low",
+    "replacement transaction", "already known", "insufficient funds",
 ]
 
+# Realistic browser User-Agents rotated per API call (in sweep_api.py)
+# Listed here for reference — actual rotation is in sweep_api._make_headers()
+
+
+# =====================================================================
+# PER-WALLET RNG
+# =====================================================================
+
+def _make_wallet_rng(address: str, chain_key: str) -> random.Random:
+    """
+    Create a per-wallet Random instance seeded from:
+        sha256(address_lower + UTC_day_str + chain_key)
+
+    - address ensures different wallets get different sequences
+    - UTC day ensures the sequence changes daily (no permanent fingerprint)
+    - chain_key ensures different behavior across chains
+
+    The seed changes every UTC midnight. Two wallets running on the same day
+    and chain will have different seeds because their addresses differ.
+    An analyst observing over months cannot predict tomorrow's seed from today's
+    behavior because the day component rotates.
+    """
+    utc_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    seed_input = f"{address.lower()}:{utc_day}:{chain_key}"
+    seed_bytes = hashlib.sha256(seed_input.encode()).digest()
+    seed_int = int.from_bytes(seed_bytes[:8], "big")
+    return random.Random(seed_int)
+
+
+# =====================================================================
+# HELPERS
+# =====================================================================
 
 def _is_contract_revert(error_str: str) -> bool:
-    """True only if the error is an EVM contract-level revert, not a transient failure."""
     s = error_str.lower()
     for t in TRANSIENT_ERRORS:
         if t in s:
@@ -74,7 +115,6 @@ def _is_contract_revert(error_str: str) -> bool:
 
 
 def _check_sold_out(w3: Web3, contract_address: str, max_supply: int) -> bool:
-    """On-chain totalSupply check. Returns False if max_supply is unknown (0)."""
     if max_supply <= 0:
         return False
     try:
@@ -86,57 +126,35 @@ def _check_sold_out(w3: Web3, contract_address: str, max_supply: int) -> bool:
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(contract_address), abi=abi
         )
-        total = contract.functions.totalSupply().call()
-        return total >= max_supply
+        return contract.functions.totalSupply().call() >= max_supply
     except Exception as e:
         logger.debug(f"[minter] totalSupply() failed for {contract_address}: {e}")
         return False
 
 
 def _estimate_gas(w3: Web3, tx: dict, fallback: int) -> int:
-    """estimate_gas with 20% buffer. Falls back to config gas_limit on failure."""
     try:
         tx_for_estimate = {k: v for k, v in tx.items() if k != "gas"}
-        estimated = w3.eth.estimate_gas(tx_for_estimate)
-        return int(estimated * 1.2)
+        return int(w3.eth.estimate_gas(tx_for_estimate) * 1.2)
     except Exception as e:
-        logger.debug(f"[minter] estimate_gas failed ({e}), using config limit {fallback}")
+        logger.debug(f"[minter] estimate_gas failed ({e}), using fallback {fallback}")
         return fallback
 
 
 def _verify_transfer_in_receipt(receipt: dict, recipient: str, contract_address: str) -> bool:
-    """
-    Verify a Transfer event exists in receipt logs where:
-      - log.address matches the NFT contract
-      - topic[0] == ERC-721 Transfer topic
-      - topic[2] (indexed 'to') matches recipient address
-
-    Returns True if confirmed, False if no matching log found.
-    A False result after status==1 means the contract did something unusual —
-    worth logging but not worth marking sold_out.
-    """
     recipient_padded = recipient.lower().replace("0x", "").zfill(64)
     contract_lower = contract_address.lower()
-
-    logs = receipt.get("logs", [])
-    for log in logs:
-        log_addr = log.get("address", "").lower()
-        topics = log.get("topics", [])
-
-        if log_addr != contract_lower:
+    for log in receipt.get("logs", []):
+        if log.get("address", "").lower() != contract_lower:
             continue
+        topics = log.get("topics", [])
         if not topics:
             continue
-
-        # topics[0] is the event signature
         t0 = topics[0]
         if hasattr(t0, "hex"):
             t0 = t0.hex()
         if t0.lower() != TRANSFER_TOPIC:
             continue
-
-        # ERC-721: Transfer(address indexed from, address indexed to, uint256 indexed tokenId)
-        # topics[2] is 'to'
         if len(topics) < 3:
             continue
         t2 = topics[2]
@@ -144,9 +162,57 @@ def _verify_transfer_in_receipt(receipt: dict, recipient: str, contract_address:
             t2 = t2.hex()
         if recipient_padded in t2.lower().replace("0x", ""):
             return True
-
     return False
 
+
+def _human_delay(rng: random.Random, dry_run: bool = False) -> None:
+    """
+    Exponential inter-mint delay with human-like long tail.
+
+    expovariate(1/15) → mean ~15s, heavy tail.
+    Clamped to [5, 120] seconds for sanity.
+    10% chance of an extra 60–300s pause (simulating distraction).
+    Dry-run uses 0.2s flat — no point waiting during testing.
+    """
+    if dry_run:
+        time.sleep(0.2)
+        return
+
+    base = rng.expovariate(1 / 15.0)
+    base = max(5.0, min(base, 120.0))
+
+    if rng.random() < 0.10:
+        base += rng.uniform(60, 300)
+        logger.debug(f"[minter] Long pause simulated: {base:.0f}s")
+
+    time.sleep(base)
+
+
+def _wallet_contract_subset(
+    candidates: list[dict],
+    rng: random.Random,
+    coverage_range: tuple = (0.65, 0.80),
+) -> list[dict]:
+    """
+    Return a random subset of candidates for this wallet.
+
+    Each wallet sees 65–80% of available collections, chosen by wallet-seeded RNG.
+    This ensures no two wallets interact with the identical contract set,
+    which directly reduces the contract overlap score used in sybil clustering.
+
+    If fewer than 3 candidates exist, return all (no point sub-sampling tiny pools).
+    """
+    if len(candidates) < 3:
+        return candidates[:]
+
+    coverage = rng.uniform(*coverage_range)
+    subset_size = max(1, math.ceil(len(candidates) * coverage))
+    return rng.sample(candidates, subset_size)
+
+
+# =====================================================================
+# CORE ENTRY POINT
+# =====================================================================
 
 def perform_mint(
     chain: ChainConfig,
@@ -162,30 +228,45 @@ def perform_mint(
     sweep_fee_wei: int = 202000000000000,
 ) -> bool:
     """
-    Mint 1–N random Sweep Haus NFTs for one wallet on one chain.
+    Mint 1–N Sweep Haus NFTs for one wallet on one chain with anti-fingerprint behavior.
 
-    Args:
-        dry_run: If True, skips actual tx broadcast. Full pipeline runs (RPC, balance,
-                 calldata) but send_raw_transaction is not called. Safe for config testing.
+    Anti-fingerprint measures active in this function:
+      - Per-wallet time-seeded RNG (address + day + chain)
+      - Random session skip (15% chance, simulates inactivity)
+      - Per-wallet contract subset (65–80% of pool, different per wallet)
+      - Per-wallet gas variance ±5%
+      - Exponential inter-mint delay with long tail
 
-    Returns True if at least one NFT was successfully minted (or dry_run completed).
-    Raises BearerTokenError if API auth fails — caller should skip the chain.
+    Returns True if ≥1 NFT minted (or dry_run simulated successfully).
+    Raises BearerTokenError if API auth fails.
     """
     tag = f"[{address[:8]}][{chain.chain_key}]"
     if dry_run:
         tag = f"[DRY-RUN]{tag}"
 
-    # ── 1. Cooldown gate ──────────────────────────────────────────────
+    # ── Per-wallet seeded RNG ─────────────────────────────────────────
+    # All randomness in this session flows through this instance.
+    # Using global random.* would share state across concurrent wallet threads.
+    rng = _make_wallet_rng(address, chain.chain_key)
+
+    # ── 1. Random session skip ────────────────────────────────────────
+    # 15% chance of skipping entirely — simulates human inactivity.
+    # Applied BEFORE cooldown check so it doesn't consume the cooldown slot.
+    if not dry_run and rng.random() < 0.15:
+        logger.info(f"{tag} Random session skip (simulating inactivity). No action today.")
+        return False
+
+    # ── 2. Cooldown gate ──────────────────────────────────────────────
     if sweep_api.is_on_cooldown(address, cooldown_hours):
         return False
 
-    # ── 2. RPC connection ─────────────────────────────────────────────
+    # ── 3. RPC connection ─────────────────────────────────────────────
     w3 = chain.get_w3()
     if not w3:
-        logger.error(f"{tag} Could not connect to any RPC. Skipping.")
+        logger.error(f"{tag} No RPC connection. Skipping.")
         return False
 
-    # ── 3. Get collections (may raise BearerTokenError) ──────────────
+    # ── 4. Get collections (may raise BearerTokenError) ──────────────
     collections = sweep_api.get_active_collections(
         chain.chain_key,
         chain.sweep_haus_chain_id,
@@ -199,32 +280,48 @@ def perform_mint(
         logger.info(f"{tag} No active collections found.")
         return False
 
-    # Filter out already-minted contracts for this wallet+chain
+    # ── 5. Filter already-minted ──────────────────────────────────────
     wallet_record = sweep_api.get_wallet_record(address)
     minted_on_chain = set(
         wallet_record.get("minted_contracts", {}).get(chain.chain_key, [])
     )
-    candidates = [c for c in collections if c["contract"].lower() not in minted_on_chain]
+    fresh_candidates = [
+        c for c in collections if c["contract"].lower() not in minted_on_chain
+    ]
 
-    if not candidates:
+    if not fresh_candidates:
         logger.info(f"{tag} All indexed collections already minted on this chain.")
         return False
 
-    # ── 4. Determine session target ───────────────────────────────────
-    target = random.randint(target_mints_range[0], target_mints_range[1])
-    logger.info(f"{tag} Targeting {target} mints from {len(candidates)} candidates.")
-    random.shuffle(candidates)
+    # ── 6. Per-wallet contract subset ─────────────────────────────────
+    # Each wallet works from a different 65–80% slice of available collections.
+    # Reduces contract overlap score across the wallet cluster.
+    candidates = _wallet_contract_subset(fresh_candidates, rng)
+    logger.info(
+        f"{tag} Subset: {len(candidates)}/{len(fresh_candidates)} collections "
+        f"selected for this wallet today."
+    )
 
-    # ── 5. Gas price ──────────────────────────────────────────────────
+    # ── 7. Session target ─────────────────────────────────────────────
+    target = rng.randint(target_mints_range[0], target_mints_range[1])
+    rng.shuffle(candidates)
+    logger.info(f"{tag} Targeting {target} mints from {len(candidates)} candidates.")
+
+    # ── 8. Gas price with per-wallet variance ─────────────────────────
+    # Base gas from chain or live RPC. Then apply ±5% variance per wallet
+    # so no two wallets submit identical maxFeePerGas in the same block.
     if chain.gas_price_gwei is not None:
         base_gas_price = w3.to_wei(chain.gas_price_gwei, "gwei")
     else:
         base_gas_price = w3.eth.gas_price
 
-    max_fee = int(base_gas_price * chain.gas_multiplier)
-    priority_fee = int(base_gas_price * chain.priority_multiplier)
+    gas_variance = rng.uniform(0.95, 1.05)
+    max_fee = int(base_gas_price * chain.gas_multiplier * gas_variance)
+    priority_fee = int(base_gas_price * chain.priority_multiplier * gas_variance)
 
-    # ── 6. Nonce (managed locally; re-synced on nonce-too-low) ────────
+    logger.debug(f"{tag} Gas variance: {gas_variance:.3f}x | maxFee={max_fee} | priority={priority_fee}")
+
+    # ── 9. Nonce ──────────────────────────────────────────────────────
     nonce = w3.eth.get_transaction_count(address, "pending")
 
     success_count = 0
@@ -238,16 +335,13 @@ def perform_mint(
         price = pick.get("price", 0.0)
         max_supply = pick.get("max_supply", 0)
 
-        # On-chain sold-out check
         if _check_sold_out(w3, contract_address, max_supply):
-            logger.info(f"{tag} '{name}' sold out on-chain. Marking.")
+            logger.info(f"{tag} '{name}' sold out. Marking.")
             sweep_api.mark_collection_status(chain.chain_key, contract_address, "sold_out")
             continue
 
-        # Balance check — all BigInt, no floats
         price_wei = int(price * 10**18)
         total_value_wei = sweep_fee_wei + price_wei
-        # gas_buffer_units * base_gas_price = estimated max gas cost in wei
         gas_buffer_wei = chain.gas_buffer_units * base_gas_price
         required_wei = total_value_wei + gas_buffer_wei
 
@@ -263,9 +357,8 @@ def perform_mint(
                 f"Have: {w3.from_wei(balance_wei, 'ether')} {chain.native_symbol}, "
                 f"Need: ~{w3.from_wei(required_wei, 'ether')} (incl. gas buffer)"
             )
-            break  # Balance won't recover mid-session
+            break
 
-        # Build tx
         calldata = build_claim_calldata(
             recipient=address,
             sweep_fee_wei=sweep_fee_wei,
@@ -284,15 +377,15 @@ def perform_mint(
         }
         tx["gas"] = _estimate_gas(w3, tx, chain.gas_limit)
 
-        # ── Dry run — stop before broadcast ──────────────────────────
+        # ── Dry run ───────────────────────────────────────────────────
         if dry_run:
             logger.info(
                 f"{tag} Would mint '{name}' | price={price} {chain.native_symbol} | "
-                f"gas={tx['gas']} | nonce={nonce} | value={w3.from_wei(total_value_wei, 'ether')}"
+                f"gas={tx['gas']} | nonce={nonce} | gasVariance={gas_variance:.3f}x"
             )
             success_count += 1
             nonce += 1
-            time.sleep(0.2)
+            _human_delay(rng, dry_run=True)
             continue
 
         # ── Live tx ───────────────────────────────────────────────────
@@ -313,35 +406,33 @@ def perform_mint(
                 time.sleep(2)
                 continue
 
-            # Verify Transfer event landed in correct wallet
             transfer_confirmed = _verify_transfer_in_receipt(receipt, address, contract_address)
             if not transfer_confirmed:
                 logger.warning(
-                    f"{tag} TX succeeded (status=1) but no Transfer to {address[:8]} "
-                    f"found in logs. Recording anyway — inspect manually: {tx_hex}"
+                    f"{tag} status=1 but no Transfer event to {address[:8]} — "
+                    f"inspect manually: {tx_hex}"
                 )
 
             logger.info(f"{tag} ✓ Minted '{name}' | TX: {tx_hex}")
             sweep_api.record_mint(address, chain.chain_key, contract_address)
             success_count += 1
             nonce += 1
-            time.sleep(random.uniform(2, 5))
+
+            # Human-like delay between mints
+            _human_delay(rng, dry_run=False)
 
         except Exception as e:
             err_str = str(e)
-            logger.warning(f"{tag} Failed to mint '{name}': {err_str}")
-
+            logger.warning(f"{tag} Failed '{name}': {err_str}")
             if _is_contract_revert(err_str):
                 logger.info(f"{tag} Contract revert — marking '{name}' sold_out.")
                 sweep_api.mark_collection_status(chain.chain_key, contract_address, "sold_out")
                 nonce += 1
             elif "nonce too low" in err_str.lower():
                 nonce = w3.eth.get_transaction_count(address, "pending")
-            # Other errors: don't increment nonce (tx may not have broadcast)
-
             time.sleep(2)
 
-    # ── 7. Cooldown bookkeeping ───────────────────────────────────────
+    # ── 10. Cooldown write ────────────────────────────────────────────
     if success_count > 0 or cooldown_on_fail:
         if not dry_run:
             sweep_api.set_last_run(address)

@@ -1,26 +1,24 @@
 """
 main.py — Entry point for the Sweep Haus NFT auto-minter.
 
-Execution flow:
-1. Parse CLI args (--dry-run, --loop, --loop-interval)
-2. Load .env, validate bearer tokens and config files
-3. Load wallets from pv.txt, proxies from proxy.txt
-4. Determine active chains via mode filter
-5. For each active chain, run wallets concurrently (up to config.concurrency)
-6. If --loop is set, sleep and repeat every N hours
+Anti-fingerprint measures in this file:
+  - Staggered wallet launch: wallets start delay_between_wallets_sec apart,
+    not simultaneously. Spreads on-chain txs across blocks instead of clustering.
+  - Loop jitter: ±10% variance on the sleep interval between runs.
+    Prevents clock-aligned daily tx clusters (e.g. always 09:00 UTC).
 
 Usage:
-  python main.py                          # single run, live txs
-  python main.py --dry-run               # single run, no txs broadcast
-  python main.py --loop                  # loop every 24h (from config)
-  python main.py --loop --loop-interval 12   # loop every 12h
-  python main.py --dry-run --loop        # dry-run loop (safe for testing)
+  python main.py                        # single run, live txs
+  python main.py --dry-run              # single run, no txs broadcast
+  python main.py --loop                 # loop every 24h (from config)
+  python main.py --loop --interval 12   # loop every 12h
+  python main.py --dry-run --loop       # safe testing loop
 
-Env vars (alternative to CLI for loop mode):
+Env vars (alternative to CLI):
   LOOP=true
   LOOP_INTERVAL_HOURS=24
 
-[RISK] Locks are in-process only. Do not run two bot instances against the same data/.
+[RISK] Locks are in-process only. Do not run two instances against the same data/.
 [RISK] Private keys are in process memory for the session duration.
 """
 
@@ -83,11 +81,7 @@ PV_FILE = Path(__file__).parent / "pv.txt"
 
 
 def load_wallets() -> list[tuple[str, str]]:
-    """
-    Load private keys from pv.txt.
-    Returns list of (address, private_key) tuples.
-    Keys are used inside worker threads and then go out of scope.
-    """
+    """Load private keys from pv.txt. Returns list of (address, private_key) tuples."""
     if not PV_FILE.exists():
         logger.error(
             f"pv.txt not found at {PV_FILE}. "
@@ -122,7 +116,7 @@ def load_wallets() -> list[tuple[str, str]]:
 
 
 # =====================================================================
-# WORKER (runs in thread pool per chain)
+# WORKER
 # =====================================================================
 
 SWEEP_FEE_WEI = 202000000000000  # 0.000202 native tokens (Sweep Haus platform fee)
@@ -175,7 +169,16 @@ def wallet_worker(
 def run_once(bot_cfg: BotConfig, wallets: list, proxies: list, dry_run: bool) -> dict:
     """
     Execute one full minting pass across all active chains and wallets.
-    Returns summary stats dict.
+
+    Wallet launches are STAGGERED — one wallet is submitted every
+    delay_between_wallets_sec seconds, not all at once.
+
+    Without staggering: all wallets hit the same contract within the same
+    block → trivial clustering signal on-chain.
+
+    With staggering (e.g. [5,15]s): wallet 0 starts at t=0, wallet 1 at
+    t=5–15s, wallet 2 at t=10–30s. Their txs land in different blocks.
+    The executor still caps simultaneous workers at config.concurrency.
     """
     active_chains = bot_cfg.get_active_chains()
     if not active_chains:
@@ -190,7 +193,10 @@ def run_once(bot_cfg: BotConfig, wallets: list, proxies: list, dry_run: bool) ->
 
     for chain in active_chains:
         logger.info(f"\n{'='*60}")
-        logger.info(f"[main] Chain: {chain.name} ({chain.chain_key})" + (" [DRY-RUN]" if dry_run else ""))
+        logger.info(
+            f"[main] Chain: {chain.name} ({chain.chain_key})"
+            + (" [DRY-RUN]" if dry_run else "")
+        )
         logger.info(f"{'='*60}")
 
         w3 = chain.get_w3()
@@ -204,22 +210,31 @@ def run_once(bot_cfg: BotConfig, wallets: list, proxies: list, dry_run: bool) ->
         ]
 
         bearer_failed = False
+        futures: dict = {}
 
         with ThreadPoolExecutor(max_workers=bot_cfg.concurrency) as executor:
-            futures = {
-                executor.submit(
+
+            # Staggered submission: sleep before each wallet launch (except first).
+            # delay_between_wallets_sec now controls LAUNCH spacing, not post-completion.
+            for idx, (i, addr, pk, proxy) in enumerate(tasks):
+                if idx > 0:
+                    stagger = random.uniform(
+                        bot_cfg.delay_between_wallets_sec[0],
+                        bot_cfg.delay_between_wallets_sec[1],
+                    )
+                    logger.debug(f"[main] Stagger: launching next wallet in {stagger:.1f}s")
+                    time.sleep(stagger)
+
+                future = executor.submit(
                     wallet_worker, i, addr, pk, chain, bot_cfg, proxy, dry_run
-                ): addr
-                for i, addr, pk, proxy in tasks
-            }
+                )
+                futures[future] = addr
 
             for future in as_completed(futures):
                 result = future.result()
                 total_attempted += 1
 
                 if result["bearer_error"]:
-                    # One wallet hit 401 — all others on this chain will too.
-                    # Cancel remaining work for this chain.
                     bearer_failed = True
                     for f in futures:
                         f.cancel()
@@ -228,16 +243,10 @@ def run_once(bot_cfg: BotConfig, wallets: list, proxies: list, dry_run: bool) ->
                 if result["success"]:
                     total_success += 1
 
-                delay = random.uniform(
-                    bot_cfg.delay_between_wallets_sec[0],
-                    bot_cfg.delay_between_wallets_sec[1],
-                )
-                time.sleep(delay)
-
         if bearer_failed:
             logger.error(
-                f"[main] Bearer token rejected for chain '{chain.chain_key}'. "
-                "Skipping remaining wallets on this chain. Update BEARER in .env."
+                f"[main] Bearer token rejected for '{chain.chain_key}'. "
+                "Update BEARER in .env."
             )
 
     return {"total_success": total_success, "total_attempted": total_attempted}
@@ -257,26 +266,26 @@ Examples:
   python main.py --dry-run              Single run, no transactions sent
   python main.py --loop                 Repeat every 24h (from config)
   python main.py --loop --interval 12   Repeat every 12h
-  python main.py --dry-run --loop       Safe loop for testing config
+  python main.py --dry-run --loop       Safe loop for testing
         """,
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run full pipeline but skip actual transaction broadcast. Safe for testing.",
+        help="Full pipeline but no transactions broadcast. Safe for config testing.",
     )
     parser.add_argument(
         "--loop",
         action="store_true",
         default=os.environ.get("LOOP", "false").lower() == "true",
-        help="Loop indefinitely. Sleeps between runs. (env: LOOP=true)",
+        help="Loop indefinitely with jittered sleep. (env: LOOP=true)",
     )
     parser.add_argument(
         "--interval",
         type=float,
         default=float(os.environ.get("LOOP_INTERVAL_HOURS", "24")),
         metavar="HOURS",
-        help="Hours between loop iterations. Default: 24. (env: LOOP_INTERVAL_HOURS)",
+        help="Base hours between loop iterations. Default: 24. (env: LOOP_INTERVAL_HOURS)",
     )
     return parser.parse_args()
 
@@ -284,7 +293,6 @@ Examples:
 def main() -> None:
     args = parse_args()
 
-    # Load .env
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
         load_dotenv(env_path)
@@ -292,14 +300,12 @@ def main() -> None:
     else:
         logger.warning("[main] .env not found — bearer tokens must be in system environment.")
 
-    # Bearer tokens
     try:
         sweep_api.load_bearer_tokens()
     except EnvironmentError as e:
         logger.error(str(e))
         sys.exit(1)
 
-    # Bot config
     try:
         bot_cfg = BotConfig()
     except FileNotFoundError as e:
@@ -311,11 +317,11 @@ def main() -> None:
         f"Concurrency: {bot_cfg.concurrency} | "
         f"Dry-run: {args.dry_run} | "
         f"Loop: {args.loop} | "
-        f"Interval: {args.interval}h"
+        f"Interval: {args.interval}h ±10%"
     )
 
     if args.dry_run:
-        logger.info("[main] *** DRY-RUN MODE — no transactions will be broadcast ***")
+        logger.info("[main] *** DRY-RUN — no transactions will be broadcast ***")
 
     wallets = load_wallets()
     proxies = load_proxies()
@@ -332,21 +338,28 @@ def main() -> None:
 
         logger.info(
             f"[main] Run #{run_number} complete. "
-            f"{stats['total_success']}/{stats['total_attempted']} sessions had successful mints."
+            f"{stats['total_success']}/{stats['total_attempted']} sessions minted."
         )
 
         if not args.loop:
             break
 
-        next_run_secs = args.interval * 3600
+        # Loop jitter: ±10% variance on the interval.
+        # Prevents clock-aligned tx clusters (e.g. all wallets always at 09:00 UTC).
+        # With 24h base: actual sleep is 21.6–26.4h, varying each run.
+        jitter = random.uniform(-0.10, 0.10)
+        actual_secs = args.interval * 3600 * (1 + jitter)
+        actual_hours = actual_secs / 3600
+
         logger.info(
-            f"[main] Sleeping {args.interval}h until next run. "
+            f"[main] Next run in {actual_hours:.1f}h "
+            f"(base {args.interval}h, jitter {jitter:+.1%}). "
             f"Press Ctrl+C to stop."
         )
         try:
-            time.sleep(next_run_secs)
+            time.sleep(actual_secs)
         except KeyboardInterrupt:
-            logger.info("[main] Interrupted by user. Exiting.")
+            logger.info("[main] Interrupted. Exiting.")
             break
 
 
