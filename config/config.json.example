@@ -48,7 +48,17 @@
       "priority_multiplier": 1.1,
 
       "_comment_gas_buffer_units": "Gas units reserved for balance check buffer. Buffer (wei) = gas_buffer_units × base_gas_price. Default 350000 is safe for most EVM chains.",
-      "gas_buffer_units": 350000
+      "gas_buffer_units": 350000,
+
+      "_comment_manual_collections": "Optional. List of manual contracts to bypass Sweep Haus API and mint directly. If configured, API fetching for this chain is bypassed.",
+      "manual_collections": [
+        {
+          "contract": "0x1234567890123456789012345678901234567890",
+          "name": "Example NFT Collection",
+          "price": 0.0,
+          "max_supply": 10000
+        }
+      ]
     },
 
     "base_mainnet": {

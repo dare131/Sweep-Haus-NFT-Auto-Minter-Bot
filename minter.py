@@ -42,6 +42,7 @@ import hashlib
 import logging
 import math
 import random
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -57,6 +58,8 @@ logger = logging.getLogger("minter")
 
 # ERC-721 Transfer event topic (keccak256("Transfer(address,address,uint256)"))
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+# ERC-1155 TransferSingle event topic (keccak256("TransferSingle(address,address,address,uint256,uint256)"))
+TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
 
 REVERT_STRINGS = [
     "!qty", "exceed", "sold out", "max supply", "!maxsupply",
@@ -141,6 +144,115 @@ def _estimate_gas(w3: Web3, tx: dict, fallback: int) -> int:
         return fallback
 
 
+def _extract_revert_data(e: Exception) -> str:
+    """Extract revert hex data from Web3 exception recursively or via attributes."""
+    data = getattr(e, "data", None)
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict) and "data" in data:
+        return str(data["data"])
+    if hasattr(e, "args") and e.args:
+        first_arg = e.args[0]
+        if isinstance(first_arg, dict):
+            val = first_arg.get("data") or first_arg.get("error", {}).get("data")
+            if isinstance(val, str):
+                return val
+        elif isinstance(first_arg, str):
+            return first_arg
+    return str(e)
+
+
+def _get_expected_price_from_revert(w3: Web3, tx_param: dict) -> Optional[int]:
+    """
+    Simulate the claim transaction via eth_call.
+    If it reverts with DropClaimInvalidTokenPrice (0xf13474e9), decode and return the expected price.
+    Otherwise, if it succeeds or reverts with a different error, return None.
+    """
+    try:
+        w3.eth.call(tx_param)
+        return None
+    except Exception as e:
+        err_str = _extract_revert_data(e).lower()
+        if "f13474e9" in err_str:
+            match = re.search(r'f13474e9([a-fA-F0-9]+)', err_str)
+            if match:
+                try:
+                    hex_data = match.group(1)
+                    # DropClaimInvalidTokenPrice parameters:
+                    # expectedCurrency (address, 32 bytes) -> first 32 bytes (64 hex chars)
+                    # expectedPricePerToken (uint256, 32 bytes) -> fourth 32 bytes (chars 192:256)
+                    # because the signature order is: actualCurrency/Price and expectedCurrency/Price
+                    expected_price_hex = hex_data[192:256]
+                    return int(expected_price_hex, 16)
+                except Exception:
+                    pass
+        return None
+
+
+def _check_wallet_fee_balance(
+    w3: Web3,
+    address: str,
+    sweep_fee_wei: int,
+    base_gas_price: int,
+    gas_buffer_units: int,
+    native_symbol: str,
+    tag: str,
+) -> bool:
+    """
+    Check wallet has enough balance to cover at minimum ONE free mint.
+
+    Even a "free" NFT (price = 0) costs:
+      - Sweep Haus platform fee: 0.000202 native tokens (e.g. ETH, X1T)
+      - Gas: estimated from live gas price × gas buffer units
+
+    This check runs ONCE per session before the collection loop starts.
+    If the wallet can't afford even one free mint, skip the entire session
+    rather than attempting each collection individually.
+
+    Why this matters for beginners:
+      On testnets like X1 EcoChain, tokens are free from faucets.
+      On mainnet chains (Base, Arbitrum, etc.), you need real ETH.
+      The platform fee alone is ~$0.0004 at $2000 ETH — small but non-zero.
+
+    Returns True if the wallet can proceed. False if balance is too low.
+    """
+    try:
+        balance_wei = w3.eth.get_balance(address)
+    except Exception as e:
+        logger.warning(f"{tag} Could not fetch balance: {e}. Proceeding anyway.")
+        return True  # Don't block — let the per-mint check catch it
+
+    # Minimum needed for one free mint (price = 0):
+    #   platform_fee + estimated_gas_cost
+    min_gas_cost_wei = gas_buffer_units * base_gas_price
+    min_required_wei = sweep_fee_wei + min_gas_cost_wei
+
+    fee_eth  = w3.from_wei(sweep_fee_wei, "ether")
+    gas_eth  = w3.from_wei(min_gas_cost_wei, "ether")
+    need_eth = w3.from_wei(min_required_wei, "ether")
+    have_eth = w3.from_wei(balance_wei, "ether")
+
+    # Always show a clear fee breakdown — beginners need to see this
+    logger.info(f"{tag} Fee breakdown for this chain:")
+    logger.info(f"{tag}   Platform fee (Sweep Haus) : {float(fee_eth):.8f} {native_symbol}")
+    logger.info(f"{tag}   Estimated gas cost        : {float(gas_eth):.8f} {native_symbol}")
+    logger.info(f"{tag}   Minimum needed (1 mint)   : {float(need_eth):.8f} {native_symbol}")
+    logger.info(f"{tag}   Wallet balance            : {float(have_eth):.8f} {native_symbol}")
+
+    if balance_wei < min_required_wei:
+        logger.warning(f"{tag} INSUFFICIENT BALANCE — cannot afford even one free NFT.")
+        logger.warning(f"{tag}   Need at least {float(need_eth):.8f} {native_symbol} (platform fee + gas).")
+        logger.warning(f"{tag}   Current balance: {float(have_eth):.8f} {native_symbol}.")
+        logger.warning(f"{tag}   Top up this wallet and try again.")
+        return False
+
+    logger.info(
+        f"{tag} Balance OK — wallet can afford approx. "
+        f"{int(balance_wei // min_required_wei)} free mint(s) on this chain."
+    )
+    return True
+
+
 def _verify_transfer_in_receipt(receipt: dict, recipient: str, contract_address: str) -> bool:
     recipient_padded = recipient.lower().replace("0x", "").zfill(64)
     contract_lower = contract_address.lower()
@@ -153,15 +265,23 @@ def _verify_transfer_in_receipt(receipt: dict, recipient: str, contract_address:
         t0 = topics[0]
         if hasattr(t0, "hex"):
             t0 = t0.hex()
-        if t0.lower() != TRANSFER_TOPIC:
-            continue
-        if len(topics) < 3:
-            continue
-        t2 = topics[2]
-        if hasattr(t2, "hex"):
-            t2 = t2.hex()
-        if recipient_padded in t2.lower().replace("0x", ""):
-            return True
+        t0_lower = t0.lower()
+        if t0_lower == TRANSFER_TOPIC:
+            if len(topics) < 3:
+                continue
+            t2 = topics[2]
+            if hasattr(t2, "hex"):
+                t2 = t2.hex()
+            if recipient_padded in t2.lower().replace("0x", ""):
+                return True
+        elif t0_lower == TRANSFER_SINGLE_TOPIC:
+            if len(topics) < 4:
+                continue
+            t3 = topics[3]
+            if hasattr(t3, "hex"):
+                t3 = t3.hex()
+            if recipient_padded in t3.lower().replace("0x", ""):
+                return True
     return False
 
 
@@ -221,11 +341,11 @@ def perform_mint(
     cooldown_hours: float,
     cooldown_on_fail: bool,
     target_mints_range: list,
-    index_cache_hours: float,
-    max_api_pages: int,
+    collections: list[dict],
     dry_run: bool = False,
     proxy_dict: Optional[dict] = None,
     sweep_fee_wei: int = 202000000000000,
+    force_run: bool = False,
 ) -> bool:
     """
     Mint 1–N Sweep Haus NFTs for one wallet on one chain with anti-fingerprint behavior.
@@ -252,12 +372,12 @@ def perform_mint(
     # ── 1. Random session skip ────────────────────────────────────────
     # 15% chance of skipping entirely — simulates human inactivity.
     # Applied BEFORE cooldown check so it doesn't consume the cooldown slot.
-    if not dry_run and rng.random() < 0.15:
+    if not dry_run and not force_run and rng.random() < 0.15:
         logger.info(f"{tag} Random session skip (simulating inactivity). No action today.")
         return False
 
     # ── 2. Cooldown gate ──────────────────────────────────────────────
-    if sweep_api.is_on_cooldown(address, cooldown_hours):
+    if not force_run and sweep_api.is_on_cooldown(address, chain.chain_key, cooldown_hours):
         return False
 
     # ── 3. RPC connection ─────────────────────────────────────────────
@@ -265,16 +385,6 @@ def perform_mint(
     if not w3:
         logger.error(f"{tag} No RPC connection. Skipping.")
         return False
-
-    # ── 4. Get collections (may raise BearerTokenError) ──────────────
-    collections = sweep_api.get_active_collections(
-        chain.chain_key,
-        chain.sweep_haus_chain_id,
-        chain.max_price_native,
-        index_cache_hours,
-        max_api_pages,
-        proxy_dict,
-    )
 
     if not collections:
         logger.info(f"{tag} No active collections found.")
@@ -321,7 +431,17 @@ def perform_mint(
 
     logger.debug(f"{tag} Gas variance: {gas_variance:.3f}x | maxFee={max_fee} | priority={priority_fee}")
 
-    # ── 9. Nonce ──────────────────────────────────────────────────────
+    # ── 9. Pre-session wallet balance check ──────────────────────────
+    # Check once upfront: can this wallet afford at least one free NFT?
+    # "Free" NFTs still cost: Sweep Haus platform fee + gas.
+    # Fails early with a clear human-readable message if balance too low.
+    if not _check_wallet_fee_balance(
+        w3, address, sweep_fee_wei, base_gas_price,
+        chain.gas_buffer_units, chain.native_symbol, tag
+    ):
+        return False
+
+    # ── 10. Nonce ─────────────────────────────────────────────────────
     nonce = w3.eth.get_transaction_count(address, "pending")
 
     success_count = 0
@@ -341,7 +461,37 @@ def perform_mint(
             continue
 
         price_wei = int(price * 10**18)
-        total_value_wei = sweep_fee_wei + price_wei
+        
+        # Pre-flight check to dynamically fetch the exact expected price from the contract's claim conditions.
+        # This resolves dynamic, oracle-converted or custom collection prices automatically.
+        price_per_token_wei = None
+        if not dry_run:
+            try:
+                # Simulate call with pricePerToken = 0 to trigger DropClaimInvalidTokenPrice
+                sim_calldata = build_claim_calldata(
+                    recipient=address,
+                    sweep_fee_wei=0,
+                    currency_native_int=chain.native_currency_int,
+                )
+                sim_tx = {
+                    "from": address,
+                    "to": Web3.to_checksum_address(contract_address),
+                    "data": sim_calldata,
+                    "value": 0,
+                }
+                price_per_token_wei = _get_expected_price_from_revert(w3, sim_tx)
+                if price_per_token_wei is not None:
+                    logger.info(f"{tag} Pre-flight resolved contract price: {w3.from_wei(price_per_token_wei, 'ether')} for '{name}'")
+            except Exception as e:
+                logger.debug(f"{tag} Pre-flight simulation error for '{name}': {e}")
+
+        # Fallback to standard config/API prices if pre-flight didn't resolve it or in dry-run mode
+        if price_per_token_wei is None:
+            price_per_token_wei = sweep_fee_wei + price_wei
+            total_value_wei = price_per_token_wei
+        else:
+            total_value_wei = price_per_token_wei
+
         gas_buffer_wei = chain.gas_buffer_units * base_gas_price
         required_wei = total_value_wei + gas_buffer_wei
 
@@ -361,7 +511,7 @@ def perform_mint(
 
         calldata = build_claim_calldata(
             recipient=address,
-            sweep_fee_wei=sweep_fee_wei,
+            sweep_fee_wei=price_per_token_wei,
             currency_native_int=chain.native_currency_int,
         )
 
@@ -394,7 +544,7 @@ def perform_mint(
                 f"{tag} Minting '{name}' | price={price} {chain.native_symbol} | nonce={nonce}"
             )
             signed = w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
             tx_hex = tx_hash.hex()
 
@@ -432,10 +582,10 @@ def perform_mint(
                 nonce = w3.eth.get_transaction_count(address, "pending")
             time.sleep(2)
 
-    # ── 10. Cooldown write ────────────────────────────────────────────
+    # ── 11. Cooldown write ────────────────────────────────────────────
     if success_count > 0 or cooldown_on_fail:
         if not dry_run:
-            sweep_api.set_last_run(address)
+            sweep_api.set_last_run(address, chain.chain_key)
 
     verb = "Simulated" if dry_run else "Minted"
     logger.info(f"{tag} Session done. {verb} {success_count}/{target} NFTs.")

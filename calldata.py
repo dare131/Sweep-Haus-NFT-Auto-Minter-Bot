@@ -52,8 +52,8 @@ def build_claim_calldata(
         + _p32(384)                  # arg6: bytes offset (0x180)
         # Allowlist proof struct (no allowlist = max values, empty proof array)
         + _p32(128)                  # bytes32[] offset within tuple (0x80)
-        + _p32(PROOF_MAX)            # quantityLimitPerWallet = max_uint256
         + _p32(0)                    # pricePerToken in proof = 0
+        + _p32(PROOF_MAX)            # quantityLimitPerWallet = max_uint256
         + _p32(0)                    # currency in proof = address(0)
         + _p32(0)                    # bytes32[] length = 0
         + _p32(0)                    # arg6 bytes length = 0

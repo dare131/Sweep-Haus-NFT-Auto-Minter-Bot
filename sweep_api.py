@@ -79,18 +79,24 @@ def load_bearer_tokens() -> None:
             tokens.append(single)
 
     if not tokens:
-        raise EnvironmentError(
-            "[sweep_api] No bearer tokens found in environment.\n"
-            "Set BEARER=... or BEARER_1=..., BEARER_2=... in your .env file."
+        logger.warning(
+            "[sweep_api] No bearer tokens found in environment. "
+            "API calls will fail unless manual_collections are configured in config.json."
         )
 
     _BEARER_TOKENS = tokens
-    logger.info(f"[sweep_api] Loaded {len(tokens)} bearer token(s).")
+    if tokens:
+        logger.info(f"[sweep_api] Loaded {len(tokens)} bearer token(s).")
 
 
 def _next_bearer() -> str:
     global _bearer_index
     with _bearer_lock:
+        if not _BEARER_TOKENS:
+            raise BearerTokenError(
+                "[sweep_api] No bearer tokens configured in environment. "
+                "Add BEARER in your .env file or define manual_collections in config.json."
+            )
         token = _BEARER_TOKENS[_bearer_index % len(_BEARER_TOKENS)]
         _bearer_index += 1
     return token
@@ -191,6 +197,21 @@ def refresh_index(
     lock = _get_index_lock(chain_key)
     with lock:
         idx = load_index(chain_key)
+
+        # Double-check cache update status to prevent concurrent API thread storms
+        updated_at_str = idx.get("updated_at")
+        if updated_at_str:
+            try:
+                updated_at = datetime.fromisoformat(updated_at_str)
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=timezone.utc)
+                seconds_since = (datetime.now(timezone.utc) - updated_at).total_seconds()
+                if seconds_since < 180:  # 3-minute grace period
+                    logger.debug(f"[sweep_api] [{chain_key}] Cache refreshed recently by another thread. Skipping API call.")
+                    return 0
+            except Exception:
+                pass
+
         added = 0
         page = 1
         page_size = 16
@@ -402,17 +423,25 @@ def record_mint(address: str, chain_key: str, contract_address: str) -> None:
         _save_wallet_minted(address, data)
 
 
-def set_last_run(address: str) -> None:
+def set_last_run(address: str, chain_key: str) -> None:
     lock = _get_wallet_lock(address)
     with lock:
         data = _load_wallet_minted(address)
-        data["last_run"] = datetime.now(timezone.utc).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        data["last_run"] = now_iso
+        last_run_per_chain = data.setdefault("last_run_per_chain", {})
+        last_run_per_chain[chain_key] = now_iso
         _save_wallet_minted(address, data)
 
 
-def is_on_cooldown(address: str, cooldown_hours: float) -> bool:
+def is_on_cooldown(address: str, chain_key: str, cooldown_hours: float) -> bool:
     record = get_wallet_record(address)
-    last_run_str = record.get("last_run")
+    # Check chain-specific cooldown first
+    last_run_str = record.get("last_run_per_chain", {}).get(chain_key)
+    # Fallback to legacy global last_run if chain-specific isn't recorded yet
+    if not last_run_str and not record.get("last_run_per_chain"):
+        last_run_str = record.get("last_run")
+        
     if not last_run_str:
         return False
     try:
@@ -422,7 +451,7 @@ def is_on_cooldown(address: str, cooldown_hours: float) -> bool:
         hours_since = (datetime.now(timezone.utc) - last_run).total_seconds() / 3600.0
         if hours_since < cooldown_hours:
             logger.info(
-                f"[{address[:8]}] Cooldown: {hours_since:.1f}h elapsed "
+                f"[{address[:8]}][{chain_key}] Cooldown: {hours_since:.1f}h elapsed "
                 f"(cooldown={cooldown_hours}h). Skipping."
             )
             return True

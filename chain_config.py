@@ -15,7 +15,40 @@ import os
 from typing import Optional
 
 from web3 import Web3
-from web3.middleware import ExtraDataToPOAMiddleware
+
+# PoA middleware — compatible with web3.py v5, v6, v7
+# Different web3 versions store this in different locations.
+# We try all known paths so the bot works without requiring a specific version.
+_POA_MIDDLEWARE = None
+_poa_import_errors = []
+
+try:
+    from web3.middleware import ExtraDataToPOAMiddleware as _POA_MIDDLEWARE
+except ImportError as e:
+    _poa_import_errors.append(f"web3.middleware: {e}")
+
+if _POA_MIDDLEWARE is None:
+    try:
+        from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware as _POA_MIDDLEWARE
+    except ImportError as e:
+        _poa_import_errors.append(f"web3.middleware.proof_of_authority: {e}")
+
+if _POA_MIDDLEWARE is None:
+    try:
+        from web3.middleware.geth_poa import geth_poa_middleware as _POA_MIDDLEWARE
+    except ImportError as e:
+        _poa_import_errors.append(f"web3.middleware.geth_poa: {e}")
+
+if _POA_MIDDLEWARE is None:
+    # No PoA middleware found — bot will still work but may fail on PoA chains
+    # with extraData > 32 bytes. Fix: pip install --upgrade "web3>=6.0.0"
+    import logging as _log
+    _log.getLogger("chain_config").warning(
+        "Could not import PoA middleware from any known web3 path. "
+        "Tried: " + " | ".join(_poa_import_errors) + ". "
+        "Fix with: pip install --upgrade web3"
+    )
+ExtraDataToPOAMiddleware = _POA_MIDDLEWARE
 
 logger = logging.getLogger("chain_config")
 
@@ -54,6 +87,15 @@ class ChainConfig:
         self.rpc_urls: list[str] = rpc_entry["rpc"]
         self.explorer: str = rpc_entry.get("explorer", "")
         self.sweep_haus_chain_id: int = rpc_entry.get("sweep_haus_chain_id", self.chain_id)
+
+        # Sweep Haus platform fee — set per chain in rpc.json as "sweep_fee_wei".
+        # This is what Sweep Haus charges per mint (on top of the NFT price + gas).
+        # It varies by chain — check sweep.haus DevTools Network tab to find the correct
+        # value for each chain you add. Default: 202000000000000 (0.000202 native tokens).
+        # How to find it: open sweep.haus, go to a collection, click Mint, then open
+        # DevTools → Network → find the transaction → look at the 'value' field.
+        self.sweep_fee_wei: int = int(rpc_entry.get("sweep_fee_wei", 202000000000000))
+
         self.native_symbol: str = rpc_entry.get("native_symbol", "ETH")
         self.native_currency_address: str = rpc_entry.get(
             "native_currency_address", "0xEeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
@@ -81,6 +123,9 @@ class ChainConfig:
         # Named "units" not "gwei" — it is multiplied BY gas price, it is not itself a price.
         self.gas_buffer_units: int = _get(c, g, "gas_buffer_units", 350000)
 
+        # Allow user to specify a manual list of collections to bypass the Sweep Haus API
+        self.manual_collections: list[dict] = c.get("manual_collections", [])
+
         self._w3: Optional[Web3] = None
 
     @property
@@ -95,7 +140,12 @@ class ChainConfig:
         for rpc_url in self.rpc_urls:
             try:
                 w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
-                w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                # Inject PoA middleware if available (needed for chains with large extraData)
+                if ExtraDataToPOAMiddleware is not None:
+                    try:
+                        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                    except Exception as _mw_err:
+                        logger.debug(f"[{self.chain_key}] PoA middleware inject skipped: {_mw_err}")
                 if w3.is_connected():
                     detected = w3.eth.chain_id
                     if detected != self.chain_id:

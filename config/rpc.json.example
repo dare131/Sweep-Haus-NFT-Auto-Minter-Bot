@@ -6,13 +6,14 @@
       "name": "X1 EcoChain Testnet",
       "type": "testnet",
       "rpc": [
-        "https://x1-testnet.xen.network/",
-        "https://x1testnet.xenfyi.com/"
+          "https://maculatus-rpc.x1eco.com/"
       ],
-      "explorer": "https://explorer.x1-testnet.xen.network",
+      "explorer": "https://maculatus-scan.x1eco.com",
       "sweep_haus_chain_id": 10778,
       "native_symbol": "X1T",
-      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
+      "_comment_sweep_fee_wei": "Sweep Haus platform fee in wei for this chain. Find it by opening sweep.haus, clicking Mint on any collection, then DevTools -> Network -> find the tx -> copy the 'value' field. Default: 202000000000000 (0.000202 native tokens).",
+      "sweep_fee_wei": 202000000000000
     },
     "base_mainnet": {
       "chain_id": 8453,
@@ -26,7 +27,9 @@
       "explorer": "https://basescan.org",
       "sweep_haus_chain_id": 8453,
       "native_symbol": "ETH",
-      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
+      "_comment_sweep_fee_wei": "Sweep Haus platform fee in wei for this chain. Find it by opening sweep.haus, clicking Mint on any collection, then DevTools -> Network -> find the tx -> copy the 'value' field. Default: 202000000000000 (0.000202 native tokens).",
+      "sweep_fee_wei": 202000000000000
     },
     "optimism_mainnet": {
       "chain_id": 10,
@@ -39,7 +42,9 @@
       "explorer": "https://optimistic.etherscan.io",
       "sweep_haus_chain_id": 10,
       "native_symbol": "ETH",
-      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
+      "_comment_sweep_fee_wei": "Sweep Haus platform fee in wei for this chain. Find it by opening sweep.haus, clicking Mint on any collection, then DevTools -> Network -> find the tx -> copy the 'value' field. Default: 202000000000000 (0.000202 native tokens).",
+      "sweep_fee_wei": 202000000000000
     },
     "arbitrum_mainnet": {
       "chain_id": 42161,
@@ -52,7 +57,9 @@
       "explorer": "https://arbiscan.io",
       "sweep_haus_chain_id": 42161,
       "native_symbol": "ETH",
-      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
+      "_comment_sweep_fee_wei": "Sweep Haus platform fee in wei for this chain. Find it by opening sweep.haus, clicking Mint on any collection, then DevTools -> Network -> find the tx -> copy the 'value' field. Default: 202000000000000 (0.000202 native tokens).",
+      "sweep_fee_wei": 202000000000000
     }
   }
 }

@@ -252,13 +252,48 @@ Proxies are assigned per-wallet by index — wallet 0 → proxy 0, wallet 1 → 
 
 ---
 
+### Telegram Alerts & Status Heartbeats (Optional)
+
+The bot supports real-time Telegram notifications for critical status updates, bearer expiration warnings, RPC errors, run summaries, and periodic heartbeat checks.
+
+1. **Create your Bot**: Message [@BotFather](https://t.me/BotFather) on Telegram, create a new bot, and copy the `BOT_TOKEN`.
+2. **Find your Chat ID**:
+   - **Private User Chat**: Send any message to the bot, then visit:
+     `https://api.telegram.org/bot<BOT_TOKEN>/getUpdates`
+     Copy the positive integer from the `"chat" -> "id"` block (e.g. `510595706`).
+   - **Private Groups/Channels**: Add the bot to your private group, grant it "Send messages" permissions, post a slash command in the group (e.g. `/start`), then open the `getUpdates` URL. Group Chat IDs are **always negative numbers** starting with `-100` (e.g. `-1005109595706`).
+3. **Configure your `.env`**:
+   ```env
+   TELEGRAM_BOT_TOKEN=123456:ABC-your-token
+   TELEGRAM_CHAT_ID=-1005109595706
+   ```
+
+*Note: In loop mode (`--loop`), a background thread will publish status reports (uptime, wallets, last run details, and next run schedules) **every 5 minutes** to confirm the bot is healthy and active.*
+
+---
+
+## Operational Security & Sybil-Proofing
+
+To protect your wallet network from being identified or clustered by on-chain analysis:
+
+1. **Funding Hygiene**: Never fund all wallets directly from a single parent address or using a concurrent bridging loop. Withdraw from a centralized exchange (CEX) to leverage shared hot-wallets, and introduce timing delays.
+2. **Exit Consolidation**: Do not sweep minted assets or residual funds back to a single vault address. Keep assets distributed, or utilize separate exchange deposit sub-accounts.
+3. **Built-in Route & Gas Diversification**:
+   - **Flat Interleaving**: Shuffles wallet-chain tasks globally, executing randomly across networks to avoid sequential clusters.
+   - **Sequence Shuffling**: Shuffles collection lists per-wallet to randomize mint ordering.
+   - **Contract Subsampling**: Sub-samples a randomized 65%-80% subset of available collections per wallet to minimize on-chain overlap score.
+   - **Gas Priority Jitter**: Applies ±5% gas priority variance per wallet to prevent matching block parameter signatures.
+   - **Launch Delay**: Staggers task launches dynamically (interactive window targets 10 minutes, loop targets 50% of cycle time, minimum 0.5s).
+
+---
+
 ## How It Works
 
 1. Bot loads wallets from `pv.txt` and active chains from `config/rpc.json` (filtered by `mode`)
 2. For each chain, active Sweep Haus collections are fetched from the API and cached to `data/sweep_index_{chain_key}.json` — one file per chain, refreshed every 6h
 3. Each wallet checks its 24h cooldown, then picks 1–5 random collections it hasn't minted on that chain
 4. Per-wallet mint state is stored in `data/minted_{address}.json` — wallets never double-mint the same contract
-5. On each successful mint, the ERC-721 Transfer event in the receipt is verified to confirm the NFT landed in the correct wallet
+5. On each successful mint, the ERC-721 Transfer or ERC-1155 TransferSingle event in the receipt is verified to confirm the NFT landed in the correct wallet
 6. Proxies rotate per-wallet. Bearer tokens rotate round-robin per API call
 7. All activity is logged to `logs/sweep_bot.log` with rotation
 
