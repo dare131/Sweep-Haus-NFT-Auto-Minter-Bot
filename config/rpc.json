@@ -12,7 +12,7 @@
       "explorer": "https://explorer.x1-testnet.xen.network",
       "sweep_haus_chain_id": 10778,
       "native_symbol": "X1T",
-      "native_currency_address": "0xEeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
     },
     "base_mainnet": {
       "chain_id": 8453,
@@ -26,7 +26,7 @@
       "explorer": "https://basescan.org",
       "sweep_haus_chain_id": 8453,
       "native_symbol": "ETH",
-      "native_currency_address": "0xEeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
     },
     "optimism_mainnet": {
       "chain_id": 10,
@@ -39,7 +39,7 @@
       "explorer": "https://optimistic.etherscan.io",
       "sweep_haus_chain_id": 10,
       "native_symbol": "ETH",
-      "native_currency_address": "0xEeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
     },
     "arbitrum_mainnet": {
       "chain_id": 42161,
@@ -52,7 +52,7 @@
       "explorer": "https://arbiscan.io",
       "sweep_haus_chain_id": 42161,
       "native_symbol": "ETH",
-      "native_currency_address": "0xEeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+      "native_currency_address": "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
     }
   }
 }
